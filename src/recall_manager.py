@@ -96,6 +96,7 @@ class RecallBotManager:
         bot_name: str = "Jarvis",
         enable_transcription: bool = True,
         enable_audio_streaming: bool = True,
+        enable_separate_audio: bool = True,
     ) -> BotSession:
         """
         Create a new bot and join a Google Meet meeting.
@@ -104,7 +105,8 @@ class RecallBotManager:
             meeting_url: Google Meet URL (e.g., https://meet.google.com/xxx-xxxx-xxx)
             bot_name: Display name for the bot in the meeting
             enable_transcription: Enable real-time transcription
-            enable_audio_streaming: Enable raw audio streaming
+            enable_audio_streaming: Enable raw audio streaming (mixed)
+            enable_separate_audio: Enable per-participant audio streaming
             
         Returns:
             BotSession: The created bot session
@@ -125,8 +127,12 @@ class RecallBotManager:
             
             if enable_audio_streaming:
                 # Note: Raw audio events require transcription provider to be configured
-                # Otherwise Recall.ai won't send audio_mixed_raw.data events
+                # Otherwise Recall.ai won't send audio events
                 events.append("audio_mixed_raw.data")
+            
+            if enable_separate_audio:
+                # Per-participant audio - includes participant info with each chunk
+                events.append("audio_separate_raw.data")
             
             # Add participant events for speaker detection
             events.extend([
@@ -173,7 +179,7 @@ class RecallBotManager:
                     "data": {
                         "kind": "mp3",
                         # Minimal silent MP3 (will be replaced with actual TTS output)
-                        "b64_data": "//uQxAAAAAANIAAAAAExBTUUzLjEwMFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVQ=="
+                        "b64_data": "//uQxAAAAAANIAAAAAExBTUUzLjEwMFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVQ=="
                     }
                 }
             },
@@ -188,6 +194,13 @@ class RecallBotManager:
                 "login_required": False,
             },
         }
+        
+        # Add audio_separate_raw config if enabled
+        if enable_separate_audio:
+            payload["recording_config"]["audio_separate_raw"] = {
+                "sample_rate": 16000,  # 16kHz mono as per spec
+                "encoding": "pcm_s16le"
+            }
         
         logger.info(f"Creating bot for meeting: {meeting_url}")
         logger.debug(f"Bot payload: {json.dumps(payload, indent=2)}")

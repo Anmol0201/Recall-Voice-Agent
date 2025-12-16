@@ -22,7 +22,7 @@ CONFIGS_TO_TEST = [
             "audio_mixed_raw": {"enabled": True},
             "realtime_endpoints": [{
                 "type": "websocket",
-                "url": "wss://twelve-reproduction-continental-logged.trycloudflare.com",
+                "url": "wss://optimize-tide-memo-progress.trycloudflare.com",
                 "events": ["audio_mixed_raw.data", "participant_events.join", "participant_events.leave"]
             }]
         }
@@ -42,7 +42,7 @@ CONFIGS_TO_TEST = [
             "audio_mixed_raw": {"enabled": True},
             "realtime_endpoints": [{
                 "type": "websocket",
-                "url": "wss://twelve-reproduction-continental-logged.trycloudflare.com",
+                "url": "wss://optimize-tide-memo-progress.trycloudflare.com",
                 "events": ["audio_mixed_raw.data", "transcript.data", "participant_events.join"]
             }]
         }
@@ -58,7 +58,7 @@ CONFIGS_TO_TEST = [
             "audio_mixed_raw": {"enabled": True},
             "realtime_endpoints": [{
                 "type": "websocket",
-                "url": "wss://twelve-reproduction-continental-logged.trycloudflare.com",
+                "url": "wss://optimize-tide-memo-progress.trycloudflare.com",
                 "events": ["audio_mixed_raw.data", "transcript.data", "participant_events.join"]
             }]
         }

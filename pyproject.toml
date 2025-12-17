@@ -26,6 +26,7 @@ dependencies = [
     # Audio processing
     "pydub>=0.25.1",
     "soundfile>=0.13.1",
+    "silero-vad>=6.2.0",
 ]
 
 [dependency-groups]

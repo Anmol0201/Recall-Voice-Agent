@@ -91,145 +91,130 @@ class RecallBotManager:
         }
     
     async def create_bot(
-        self,
-        meeting_url: str,
-        bot_name: str = "Jarvis",
-        enable_transcription: bool = True,
-        enable_audio_streaming: bool = True,
-        enable_separate_audio: bool = True,
+    self,
+    meeting_url: str,
+    bot_name: str = "Jarvis",
     ) -> BotSession:
         """
-        Create a new bot and join a Google Meet meeting.
-        
-        Args:
-            meeting_url: Google Meet URL (e.g., https://meet.google.com/xxx-xxxx-xxx)
-            bot_name: Display name for the bot in the meeting
-            enable_transcription: Enable real-time transcription
-            enable_audio_streaming: Enable raw audio streaming (mixed)
-            enable_separate_audio: Enable per-participant audio streaming
-            
-        Returns:
-            BotSession: The created bot session
+        Create a Recall.ai bot with:
+        - diarized transcription
+        - per-participant raw audio
+        - speech_on / speech_off events
         """
-        # Build real-time endpoints configuration
-        realtime_endpoints = []
-        events = []
-        
-        if self.websocket_url:
-            # Add events for real-time processing
-            # Using Recall.ai's built-in transcription for simplicity
-            # You need to configure a transcription provider at:
-            # https://us-west-2.recall.ai/dashboard/transcription
-            
-            if enable_transcription:
-                # Request transcript events (requires transcription provider configured)
-                events.extend(["transcript.data", "transcript.partial_data"])
-            
-            if enable_audio_streaming:
-                # Note: Raw audio events require transcription provider to be configured
-                # Otherwise Recall.ai won't send audio events
-                events.append("audio_mixed_raw.data")
-            
-            if enable_separate_audio:
-                # Per-participant audio - includes participant info with each chunk
-                events.append("audio_separate_raw.data")
-            
-            # Add participant events for speaker detection
-            events.extend([
-                "participant_events.join",
-                "participant_events.leave", 
-                "participant_events.speech_on",
-                "participant_events.speech_off",
-            ])
-            
-            realtime_endpoints.append({
+
+        events = [
+            # Transcription
+            "transcript.data",
+            "transcript.partial_data",
+
+            # Per-participant audio
+            "audio_separate_raw.data",
+
+            # Speaker activity
+            "participant_events.speech_on",
+            "participant_events.speech_off",
+            "participant_events.join",
+            "participant_events.leave",
+        ]
+
+        realtime_endpoints = [
+            {
                 "type": "websocket",
                 "url": self.websocket_url,
                 "events": events,
-            })
-        
-        # Build the bot creation payload
+            }
+        ]
+
         payload = {
             "meeting_url": meeting_url,
             "bot_name": bot_name,
+
+            # ============================
+            # RECORDING CONFIG (CRITICAL)
+            # ============================
             "recording_config": {
-                # Use RecallAI's built-in transcription (NO external API key needed!)
-                # This is FREE and works immediately
+
+                # ---- TRANSCRIPTION (MANDATORY) ----
                 "transcript": {
                     "provider": {
                         "recallai_streaming": {
                             "language_code": "en",
+                            "mode": "prioritize_accuracy",
                             "filter_profanity": False,
-                            "mode": "prioritize_accuracy"
+
+                            # 🚨 THIS ENABLES speech_on/off
+                            "diarization": True,
                         }
                     }
                 },
-                # Also request raw audio (for LiveKit processing)
-                "audio_mixed_raw": {
-                    "sample_rate": 48000,
-                    "encoding": "pcm_s16le"
+
+                # ---- PER PARTICIPANT AUDIO ----
+                "audio_separate_raw": {
+                    "sample_rate": 16000,
+                    "encoding": "pcm_s16le",
                 },
-                # Real-time endpoints for WebSocket streaming
+
+                # ---- REALTIME EVENTS ----
                 "realtime_endpoints": realtime_endpoints,
             },
-            # Automatic audio output configuration (required to use output_audio endpoint)
-            # Using a minimal silent audio as placeholder
+
+            # ============================
+            # AUDIO OUTPUT (REQUIRED)
+            # ============================
             "automatic_audio_output": {
                 "in_call_recording": {
                     "data": {
                         "kind": "mp3",
-                        # Minimal silent MP3 (will be replaced with actual TTS output)
                         "b64_data": "//uQxAAAAAANIAAAAAExBTUUzLjEwMFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVQ=="
                     }
                 }
             },
-            # Auto-leave settings
+
+            # ============================
+            # AUTO LEAVE
+            # ============================
             "automatic_leave": {
-                "waiting_room_timeout": 300,  # 5 minutes
+                "waiting_room_timeout": 300,
                 "noone_joined_timeout": 300,
                 "everyone_left_timeout": 30,
             },
-            # Google Meet specific settings
+
+            # ============================
+            # GOOGLE MEET
+            # ============================
             "google_meet": {
                 "login_required": False,
             },
         }
-        
-        # Add audio_separate_raw config if enabled
-        if enable_separate_audio:
-            payload["recording_config"]["audio_separate_raw"] = {
-                "sample_rate": 16000,  # 16kHz mono as per spec
-                "encoding": "pcm_s16le"
-            }
-        
+
         logger.info(f"Creating bot for meeting: {meeting_url}")
-        logger.debug(f"Bot payload: {json.dumps(payload, indent=2)}")
-        
+        logger.debug(json.dumps(payload, indent=2))
+
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"{self.base_url}/api/v1/bot/",
                 headers=self._get_headers(),
                 json=payload,
             ) as response:
-                if response.status == 201:
-                    data = await response.json()
-                    bot_id = data["id"]
-                    
-                    bot_session = BotSession(
-                        bot_id=bot_id,
-                        meeting_url=meeting_url,
-                        bot_name=bot_name,
-                        status=BotStatus.JOINING_CALL,
-                        metadata=data,
-                    )
-                    self.sessions[bot_id] = bot_session
-                    
-                    logger.info(f"Bot created successfully: {bot_id}")
-                    return bot_session
-                else:
-                    error_text = await response.text()
-                    logger.error(f"Failed to create bot: {response.status} - {error_text}")
-                    raise Exception(f"Failed to create bot: {response.status} - {error_text}")
+                if response.status != 201:
+                    text = await response.text()
+                    raise RuntimeError(f"Recall bot creation failed: {response.status} {text}")
+
+                data = await response.json()
+                bot_id = data["id"]
+
+                bot_session = BotSession(
+                    bot_id=bot_id,
+                    meeting_url=meeting_url,
+                    bot_name=bot_name,
+                    status=BotStatus.JOINING_CALL,
+                    metadata=data,
+                )
+
+                self.sessions[bot_id] = bot_session
+                logger.info(f"Bot created successfully: {bot_id}")
+                return bot_session
+
     
     async def get_bot_status(self, bot_id: str) -> dict:
         """

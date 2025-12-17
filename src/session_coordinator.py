@@ -156,7 +156,7 @@ class SessionCoordinator:
         self.sessions: dict[str, VoiceSession] = {}
         
         # Processing configuration
-        self.silence_threshold = 1.5  # Seconds of silence before processing
+        self.silence_threshold = 0.5  # Seconds of silence before processing
         self.min_utterance_length = 3  # Minimum characters to process
         
         # Background tasks
@@ -216,9 +216,7 @@ class SessionCoordinator:
         # Create bot via Recall.ai
         bot_session = await self.recall_manager.create_bot(
             meeting_url=meeting_url,
-            bot_name=bot_name,
-            enable_transcription=True,
-            enable_audio_streaming=False,  # Using transcription instead
+            bot_name=bot_name
         )
         
         # Create voice session

@@ -9,13 +9,51 @@ import logging
 from typing import Callable, Optional
 from dataclasses import dataclass, field
 from datetime import datetime
-from assistant import transcribe_base64_pcm
+from assistant import transcribe_base64_pcm, has_speech
 
+import numpy as np
 import websockets
 from websockets.server import WebSocketServerProtocol
 
 logger = logging.getLogger("recall-websocket")
 logger.setLevel(logging.INFO)
+
+SAMPLE_RATE = 16000
+BYTES_PER_SECOND = SAMPLE_RATE * 2
+MIN_TRANSCRIBE_SECONDS = 0.8
+MIN_TRANSCRIBE_BYTES = int(MIN_TRANSCRIBE_SECONDS * BYTES_PER_SECOND)
+MAX_BUFFER_SECONDS = 5
+MAX_BUFFER_BYTES = int(MAX_BUFFER_SECONDS * BYTES_PER_SECOND)
+
+# Silence detection settings
+SILENCE_THRESHOLD = 1500  # RMS amplitude threshold for silence (raised from 500)
+SILENCE_DURATION_MS = 800  # Trigger transcription after this much silence (ms)
+SILENCE_CHUNKS_REQUIRED = int(SILENCE_DURATION_MS / 200)  # ~200ms per chunk from Recall
+
+def concat_pcm(chunks):
+    return b"".join(c.buffer for c in chunks)
+
+
+def is_silent_chunk(pcm_bytes: bytes, threshold: int = SILENCE_THRESHOLD) -> tuple[bool, float]:
+    """Check if an audio chunk is silent based on RMS amplitude."""
+    if len(pcm_bytes) < 2:
+        return True, 0.0
+    audio = np.frombuffer(pcm_bytes, dtype=np.int16)
+    rms = np.sqrt(np.mean(audio.astype(np.float32) ** 2))
+    return rms < threshold, rms  # Return both result and RMS value
+
+
+def looks_like_speech(text: str) -> bool:
+    if not text:
+        return False
+    if len(text) < 3:
+        return False
+    alpha_ratio = sum(c.isalpha() for c in text) / max(len(text), 1)
+    if alpha_ratio < 0.6:
+        return False
+    if len(text.split()) == 1 and len(text) <= 3:
+        return False
+    return True
 
 
 @dataclass
@@ -114,6 +152,12 @@ class RecallWebSocketServer:
         # Per-participant audio buffers (for accumulating audio per speaker)
         self.participant_audio_buffers: dict[str, dict[int, list[ParticipantAudioChunk]]] = {}
         
+        # Track consecutive silent chunks per participant for auto-segmentation
+        self.silence_counters: dict[str, dict[int, int]] = {}
+        
+        # Lock to prevent concurrent processing of same participant's audio
+        self.processing_locks: dict[str, dict[int, bool]] = {}
+        
         self.server = None
         self._running = False
         
@@ -191,6 +235,8 @@ class RecallWebSocketServer:
     
     async def _route_event(self, bot_id: Optional[str], event_type: str, event_data: dict):
         """Route event to the appropriate handler"""
+        
+
         
         if event_type == "transcript.data":
             await self._handle_transcript(bot_id, event_data, is_partial=False)
@@ -280,100 +326,228 @@ class RecallWebSocketServer:
     
     async def _handle_separate_audio(self, bot_id: Optional[str], event_data: dict):
         """Handle per-participant raw audio events (audio_separate_raw.data)"""
+
         data = event_data.get("data", {})
-        
-        
-        # Audio is base64-encoded raw PCM: 16kHz mono, S16LE
         buffer_b64 = data.get("buffer", "")
-        if not buffer_b64:
+        if not buffer_b64 or not bot_id:
             return
-        
+
         try:
             buffer_bytes = base64.b64decode(buffer_b64)
-            transcribed_text = transcribe_base64_pcm(buffer_bytes)
-            
-            
         except Exception as e:
-            logger.error(f"Failed to decode separate audio buffer: {e}")
+            logger.error(f"Failed to decode audio buffer: {e}")
             return
-        
-        # Extract timestamp
+
+
         timestamp_data = data.get("timestamp", {})
-        timestamp = timestamp_data.get("relative", 0.0)
-        absolute_timestamp = timestamp_data.get("absolute")
-        
-        # Extract participant info
         participant = data.get("participant", {})
+
         participant_id = participant.get("id", 0)
-        participant_name = participant.get("name")
-        is_host = participant.get("is_host", False)
-        platform = participant.get("platform")
-        email = participant.get("email")
-        extra_data = participant.get("extra_data", {})
-        
+        participant_name = participant.get("name") or f"Participant {participant_id}"
+
         chunk = ParticipantAudioChunk(
             buffer=buffer_bytes,
-            timestamp=timestamp,
-            absolute_timestamp=absolute_timestamp,
+            timestamp=timestamp_data.get("relative", 0.0),
+            absolute_timestamp=timestamp_data.get("absolute"),
             participant_id=participant_id,
             participant_name=participant_name,
-            is_host=is_host,
-            platform=platform,
-            email=email,
-            extra_data=extra_data,
+            is_host=participant.get("is_host", False),
+            platform=participant.get("platform"),
+            email=participant.get("email"),
+            extra_data=participant.get("extra_data", {}),
         )
+
+        # ---- BUFFER AUDIO ----
+        self.participant_audio_buffers.setdefault(bot_id, {})
+        self.participant_audio_buffers[bot_id].setdefault(participant_id, [])
+        self.silence_counters.setdefault(bot_id, {})
+        self.silence_counters[bot_id].setdefault(participant_id, 0)
+        self.processing_locks.setdefault(bot_id, {})
+        self.processing_locks[bot_id].setdefault(participant_id, False)
+
+        buf = self.participant_audio_buffers[bot_id][participant_id]
+        buf.append(chunk)
+
+        # ---- CAP BUFFER (~5s) ----
+        total_bytes = sum(len(c.buffer) for c in buf)
+        while total_bytes > MAX_BUFFER_BYTES:
+            removed = buf.pop(0)
+            total_bytes -= len(removed.buffer)
+
+        # Log first chunk per participant to debug ID matching
+        if len(buf) == 1:
+            # logger.info(
+            #     f"[BUFFER_START] participant_id={participant_id}, "
+            #     f"name={participant_name}"
+            # )
+            pass
+            
+
+        # ---- SILENCE DETECTION ----
+        is_silent, rms = is_silent_chunk(buffer_bytes)
         
-        # Store in per-participant buffer for potential accumulation
-        if bot_id:
-            if bot_id not in self.participant_audio_buffers:
-                self.participant_audio_buffers[bot_id] = {}
-            if participant_id not in self.participant_audio_buffers[bot_id]:
-                self.participant_audio_buffers[bot_id][participant_id] = []
-            # Keep last N chunks per participant (prevent memory leak)
-            self.participant_audio_buffers[bot_id][participant_id].append(chunk)
-            if len(self.participant_audio_buffers[bot_id][participant_id]) > 100:
-                self.participant_audio_buffers[bot_id][participant_id].pop(0)
+        # Log RMS periodically (every 10th chunk to avoid spam)
+        if len(buf) % 10 == 0:
+            # logger.info(f"[RMS] {participant_name}: RMS={rms:.0f}, threshold={SILENCE_THRESHOLD}, silent={is_silent}")
+            pass
         
-        speaker = participant_name or f"Participant {participant_id}"
-        logger.info(f"[SEPARATE_AUDIO] {speaker}: {len(buffer_bytes)} bytes @ {timestamp:.2f}s")
-        logger.info(f"Speaker {speaker}:  {transcribed_text}")
+        if is_silent:
+            self.silence_counters[bot_id][participant_id] += 1
+        else:
+            self.silence_counters[bot_id][participant_id] = 0
+
+        # ---- TRIGGER ON SILENCE ----
+        silence_count = self.silence_counters[bot_id][participant_id]
+        is_processing = self.processing_locks[bot_id][participant_id]
+        has_enough_audio = total_bytes >= MIN_TRANSCRIBE_BYTES
+
+        if silence_count >= SILENCE_CHUNKS_REQUIRED and has_enough_audio and not is_processing:
+            # logger.info(f"[SILENCE] Detected {silence_count} silent chunks for {participant_name}, processing...")
+            # Reset silence counter
+            self.silence_counters[bot_id][participant_id] = 0
+            # Process in background to not block audio handling
+            asyncio.create_task(self._process_participant_audio(bot_id, participant_id, participant_name))
+
+    async def _process_participant_audio(
+        self,
+        bot_id: str,
+        participant_id: int,
+        participant_name: str,
+    ):
+        """Process buffered audio for a participant - shared by silence detection and speech_off"""
         
-        # Call participant audio callback
-        if self.on_participant_audio and bot_id:
+        # Acquire processing lock
+        self.processing_locks.setdefault(bot_id, {})
+        if self.processing_locks.get(bot_id, {}).get(participant_id, False):
+            # logger.debug(f"[SKIP] Already processing audio for {participant_name}")
+            return
+        self.processing_locks[bot_id][participant_id] = True
+        
+        try:
+            # ---- FETCH BUFFERED AUDIO ----
+            bot_buffers = self.participant_audio_buffers.get(bot_id, {})
+            buffers = bot_buffers.get(participant_id)
+
+            if not buffers:
+                # logger.debug(f"[SKIP] No audio buffered for {participant_name}")
+                return
+
+            pcm = b"".join(chunk.buffer for chunk in buffers)
+            duration_sec = len(pcm) / BYTES_PER_SECOND
+            # logger.info(f"[PROCESS] {participant_name}: {duration_sec:.2f}s ({len(pcm)} bytes)")
+
+            # Clear buffer immediately
+            self.participant_audio_buffers[bot_id][participant_id] = []
+
+            # ---- MINIMUM DURATION CHECK ----
+            if len(pcm) < MIN_TRANSCRIBE_BYTES:
+                logger.info(
+                    # f"[SKIP] Dropped short utterance from {participant_name} "
+                    f"({duration_sec:.2f}s < {MIN_TRANSCRIBE_SECONDS}s)"
+                )
+                return
+
+            # ---- VAD ON FULL UTTERANCE (non-blocking) ----
+            # logger.info(f"[VAD] Running VAD for {participant_name}...")
             try:
-                await self.on_participant_audio(bot_id, chunk)
+                has_voice = await asyncio.to_thread(has_speech, pcm)
+                if not has_voice:
+                    # logger.info(f"[SKIP] VAD rejected utterance from {participant_name}")
+                    return
+                logger.info(f"[VAD] Speech detected for {participant_name}")
             except Exception as e:
-                logger.error(f"Error in participant audio callback: {e}", exc_info=True)
+                logger.error(f"[ERROR] VAD failed: {e}", exc_info=True)
+                return
+
+            # ---- TRANSCRIBE (non-blocking) ----
+            logger.info(f"[ASR] Sending to Whisper for {participant_name}...")
+            try:
+                text = await asyncio.to_thread(transcribe_base64_pcm, pcm)
+                logger.info(f"[ASR] Whisper returned: '{text}'")
+            except Exception as e:
+                logger.error(f"[ERROR] ASR failed: {e}", exc_info=True)
+                return
+
+            if not text or not looks_like_speech(text):
+                logger.info(f"[SKIP] Dropped non-speech text: '{text}'")
+                return
+
+            # ---- FINAL OUTPUT ----
+            logger.info(f"Speaker {participant_name}: {text}")
+
+            # Optional downstream hook
+            if self.on_transcript:
+                utterance = TranscriptUtterance(
+                    text=text,
+                    participant_id=participant_id,
+                    participant_name=participant_name,
+                    is_partial=False,
+                    timestamp=0.0,
+                )
+                try:
+                    await self.on_transcript(bot_id, utterance)
+                except Exception as e:
+                    logger.error(f"Error in transcript callback: {e}", exc_info=True)
+                    
+        finally:
+            # Release processing lock
+            self.processing_locks[bot_id][participant_id] = False
+
     
-    async def _handle_participant_event(self, bot_id: Optional[str], event_name: str, event_data: dict):
-        """Handle participant events"""
+    async def _handle_participant_event(
+    self,
+    bot_id: Optional[str],
+    event_name: str,
+    event_data: dict,
+    ):
+        """Handle participant events (speech_on / speech_off)"""
+
+        if not bot_id:
+            return
+
         data = event_data.get("data", {})
         participant = data.get("participant", {})
         timestamp_data = data.get("timestamp", {})
-        
+
+        participant_id = participant.get("id", 0)
+        participant_name = participant.get("name") or f"Participant {participant_id}"
+
         event = ParticipantEvent(
             event_type=event_name,
-            participant_id=participant.get("id", 0),
-            participant_name=participant.get("name"),
+            participant_id=participant_id,
+            participant_name=participant_name,
             timestamp=timestamp_data.get("relative", 0.0),
         )
+
+        # ===============================
+        # SPEECH START
+        # ===============================
+        if event_name == "speech_on":
+            self.current_speakers.setdefault(bot_id, set()).add(participant_id)
+            logger.info(f"[SPEECH_ON] participant_id={participant_id}, name={participant_name}")
+            return
+
+        # ===============================
+        # ONLY HANDLE SPEECH END
+        # ===============================
+        if event_name != "speech_off":
+            return
+
+        self.current_speakers.get(bot_id, set()).discard(participant_id)
+        logger.info(f"[SPEECH_OFF] participant_id={participant_id}, name={participant_name}")
         
-        # Track current speakers
-        if bot_id:
-            if event_name == "speech_on":
-                self.current_speakers.setdefault(bot_id, set()).add(event.participant_id)
-            elif event_name == "speech_off":
-                self.current_speakers.get(bot_id, set()).discard(event.participant_id)
+        # Reset silence counter and process any remaining audio
+        self.silence_counters.setdefault(bot_id, {})
+        self.silence_counters[bot_id][participant_id] = 0
         
-        speaker = event.participant_name or f"Participant {event.participant_id}"
-        logger.info(f"[PARTICIPANT] {event_name}: {speaker}")
-        
-        # Call participant event callback
-        if self.on_participant_event and bot_id:
-            try:
-                await self.on_participant_event(bot_id, event)
-            except Exception as e:
-                logger.error(f"Error in participant event callback: {e}", exc_info=True)
+        # Process audio (will handle empty buffer gracefully)
+        await self._process_participant_audio(bot_id, participant_id, participant_name)
+
+        # Optional downstream hook for the event itself
+        if self.on_participant_event:
+            await self.on_participant_event(bot_id, event)
+
+
     
     def is_someone_speaking(self, bot_id: str) -> bool:
         """Check if anyone is currently speaking in the meeting"""
